@@ -3,17 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>周期变星候选筛选 · Lomb–Scargle</title>
+<title>周期变星候选筛选 · 周期筛查与食双星形态判别</title>
 <style>
-  :root { --blue:#1f5fa8; --red:#c0392b; --green:#1e8449; --gray:#666; }
+  :root { --blue:#1f5fa8; --red:#c0392b; --green:#1e8449; --amber:#b9770e;
+          --gray:#666; --purple:#6c3483; }
   * { box-sizing: border-box; }
   body { margin:0; font-family:"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
          background:#f4f6f9; color:#222; }
   header { background:linear-gradient(135deg,#163a5f,#1f5fa8); color:#fff;
            padding:22px 28px; }
   header h1 { margin:0 0 6px; font-size:22px; }
-  header p { margin:0; font-size:13px; opacity:.88; max-width:900px; line-height:1.6; }
-  main { max-width:1080px; margin:22px auto; padding:0 16px 40px; }
+  header p { margin:0; font-size:13px; opacity:.88; max-width:980px; line-height:1.6; }
+  main { max-width:1120px; margin:22px auto; padding:0 16px 40px; }
   .card { background:#fff; border:1px solid #e2e7ee; border-radius:10px;
           padding:18px 20px; margin-bottom:18px; box-shadow:0 1px 3px rgba(20,40,70,.06); }
   .card h2 { margin:0 0 14px; font-size:16px; color:#163a5f; }
@@ -21,26 +22,31 @@
   label { display:flex; flex-direction:column; font-size:13px; color:#444; gap:4px; }
   input[type=file], input[type=number] { padding:7px 9px; border:1px solid #c9d2de;
     border-radius:6px; font-size:13px; background:#fbfcfe; }
-  input[type=number] { width:130px; }
+  input[type=number] { width:150px; }
   button { padding:8px 16px; border:0; border-radius:6px; font-size:13px;
            cursor:pointer; background:var(--blue); color:#fff; }
   button.secondary { background:#5d6d7e; }
   button.danger { background:var(--red); }
   button:disabled { background:#aab4c0; cursor:not-allowed; }
   .hint { font-size:12px; color:var(--gray); margin:10px 0 0; line-height:1.7; }
-  #msg { margin-top:10px; font-size:13px; min-height:18px; }
-  #msg.err { color:var(--red); } #msg.ok { color:var(--green); }
+  .msg { margin-top:10px; font-size:13px; min-height:18px; }
+  .msg.err { color:var(--red); } .msg.ok { color:var(--green); }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #edf0f5; }
   th { color:#556; font-weight:600; background:#f8fafc; }
   .badge { display:inline-block; padding:2px 10px; border-radius:12px;
-           font-size:12px; color:#fff; }
-  .st-running   { background:#b9770e; }
+           font-size:12px; color:#fff; white-space:nowrap; }
+  .st-running   { background:var(--amber); }
   .st-done      { background:var(--green); }
   .st-failed    { background:var(--red); }
   .st-cancelled { background:#5d6d7e; }
+  .kind-period     { background:var(--blue); }
+  .kind-morphology { background:var(--purple); }
+  .v-double_eclipse      { background:var(--red); }
+  .v-no_double_eclipse   { background:var(--green); }
+  .v-needs_review        { background:var(--amber); }
   .mono { font-family:ui-monospace,Consolas,monospace; }
-  #slots { font-size:12px; color:var(--gray); margin-bottom:8px; }
+  .slots { font-size:12px; color:var(--gray); margin-bottom:8px; }
   .metrics { display:flex; flex-wrap:wrap; gap:14px; margin:6px 0 14px; }
   .metric { background:#f4f8fd; border:1px solid #dbe7f5; border-radius:8px;
             padding:10px 16px; min-width:150px; }
@@ -54,48 +60,98 @@
   .errbox { background:#fdf0ee; border:1px solid #f2c7c0; color:#8f2d20;
             border-radius:8px; padding:10px 14px; font-size:13px;
             white-space:pre-wrap; }
+  .reasonbox { background:#f5f8fc; border:1px solid #d8e3f2; border-radius:8px;
+               padding:10px 14px; font-size:13px; line-height:1.7; margin:6px 0 14px; }
+  .reasonbox li { margin-bottom:3px; }
   .row-actions button { margin-right:6px; padding:5px 10px; font-size:12px; }
+  .tabs { display:flex; gap:8px; margin-bottom:16px; }
+  .tab { padding:9px 20px; border-radius:8px 8px 0 0; background:#e4eaf2;
+         color:#3a4a5e; font-size:14px; cursor:pointer; border:1px solid #d5dde7;
+         border-bottom:none; }
+  .tab.active { background:#fff; color:var(--blue); font-weight:600; }
+  .tabpane { display:none; } .tabpane.active { display:block; }
+  .night-table { font-size:12px; }
+  .night-table th, .night-table td { padding:6px 8px; }
+  .fit-supports_2p { color:var(--green); font-weight:600; }
+  .fit-supports_p  { color:var(--red); font-weight:600; }
+  .fit-neutral     { color:var(--gray); }
+  .fit-not_evaluable { color:#999; }
+  .scrollx { overflow-x:auto; }
 </style>
 </head>
 <body>
 <header>
   <h1>周期变星候选筛选</h1>
-  <p>上传单颗星的测光序列(CSV,含 time_day、flux 两列),系统以带浮动均值的
-     Lomb–Scargle 周期图在指定周期范围内搜索信号,展示最高峰周期、功率谱与
-     相位折叠散点,并通过 200 次通量置换估计尾概率,供人工复核。</p>
+  <p>两条互补流水线:① <b>周期筛查</b>用带浮动均值的 Lomb–Scargle 周期图搜索信号,
+     给出最高峰周期、功率谱、相位折叠与置换尾概率;② <b>食双星形态判别</b>针对相位图中
+     两个疑似食谷,分别按 P 与 2P 折相,做同夜基线校正后的交替食谷深度比较,结合测量
+     误差与两种折相的留一夜拟合表现,判断是否值得按食双星复核。</p>
 </header>
 <main>
-  <section class="card">
-    <h2>提交新批</h2>
-    <form id="submitForm">
-      <label>测光 CSV 文件
-        <input type="file" name="file" accept=".csv,text/csv" required>
-      </label>
-      <label>周期下限(天)
-        <input type="number" name="period_min" step="any" min="0" value="2" required>
-      </label>
-      <label>周期上限(天)
-        <input type="number" name="period_max" step="any" min="0" value="10" required>
-      </label>
-      <button type="submit">提交计算</button>
-      <button type="button" class="secondary" id="sampleBtn">载入虚构样例并提交</button>
-    </form>
-    <div id="msg"></div>
-    <p class="hint">要求:至少 10 行;time_day、flux 均为有限数值;观测时刻互异;
-       0 &lt; 周期下限 &lt; 周期上限。频率范围取周期范围的倒数,均匀取 10000 点。
-       每批使用两个计算子进程,最多两批并行,超额将被拒绝(HTTP 429)。</p>
+  <div class="tabs">
+    <div class="tab active" data-tab="period">① 周期筛查(Lomb–Scargle)</div>
+    <div class="tab" data-tab="morph">② 食双星形态判别</div>
+  </div>
+
+  <!-- ===================== 周期筛查 ===================== -->
+  <section class="tabpane active" id="pane-period">
+    <section class="card">
+      <h2>提交周期筛查批处理</h2>
+      <form id="periodForm">
+        <label>测光 CSV 文件(time_day、flux)
+          <input type="file" name="file" accept=".csv,text/csv" required>
+        </label>
+        <label>周期下限(天)
+          <input type="number" name="period_min" step="any" min="0" value="2" required>
+        </label>
+        <label>周期上限(天)
+          <input type="number" name="period_max" step="any" min="0" value="10" required>
+        </label>
+        <button type="submit">提交计算</button>
+        <button type="button" class="secondary" id="sampleBtn">载入虚构样例并提交</button>
+      </form>
+      <div class="msg" id="periodMsg"></div>
+      <p class="hint">要求:至少 10 行;time_day、flux 均为有限数值;观测时刻互异;
+         0 &lt; 周期下限 &lt; 周期上限。频率范围取周期范围的倒数,均匀取 10000 点。
+         每批使用两个计算子进程,最多两批并行,超额将被拒绝(HTTP 429)。</p>
+    </section>
+  </section>
+
+  <!-- ===================== 食双星形态判别 ===================== -->
+  <section class="tabpane" id="pane-morph">
+    <section class="card">
+      <h2>提交食双星形态判别</h2>
+      <form id="morphForm">
+        <label>测光 CSV 文件(night_id、time_day、flux、flux_err)
+          <input type="file" name="file" accept=".csv,text/csv" required>
+        </label>
+        <label>最高峰周期 P(天,来自周期筛查)
+          <input type="number" name="period" step="any" min="0" value="3.3" required>
+        </label>
+        <button type="submit">提交判别</button>
+        <button type="button" class="secondary" id="morphSampleBtn">载入虚构食双星样例并提交</button>
+      </form>
+      <div class="msg" id="morphMsg"></div>
+      <p class="hint">要求:CSV 含 <b>night_id、time_day、flux、flux_err</b> 四列;所有数值有限,
+         flux_err 全为正数,观测时刻互异,至少 2 个不同 night_id。系统分别按 P 与 2P 折相,
+         逐夜做同夜基线校正后比较两类食谷深度;两类食谷各须有 ≥2 个不同夜晚同时覆盖谷底与
+         邻近基线。单晚密集采样或夜间零点差不能充当证据;覆盖不足或夜间结论矛盾标「待复核」,
+         覆盖充分但无稳定差异标「未见双食结构」。</p>
+    </section>
   </section>
 
   <section class="card">
-    <h2>批处理列表</h2>
-    <div id="slots"></div>
+    <h2>批处理列表(两条流水线共用)</h2>
+    <div class="slots" id="slots"></div>
+    <div class="scrollx">
     <table>
       <thead><tr>
-        <th>ID</th><th>文件</th><th>行数</th><th>周期范围(天)</th>
+        <th>ID</th><th>类型</th><th>文件</th><th>行数</th><th>参数</th>
         <th>提交时间</th><th>状态</th><th>操作</th>
       </tr></thead>
-      <tbody id="jobRows"><tr><td colspan="7">暂无批处理</td></tr></tbody>
+      <tbody id="jobRows"><tr><td colspan="8">暂无批处理</td></tr></tbody>
     </table>
+    </div>
   </section>
 
   <section class="card" id="detailCard" hidden>
@@ -111,72 +167,118 @@ const esc = (s) => String(s).replace(/[&<>"']/g,
 let selectedJob = null;
 let lastDetailSig = null;
 
-function showMsg(text, ok) {
-  const m = $("msg");
-  m.textContent = text;
-  m.className = ok ? "ok" : "err";
+const STATE_TEXT = { running: "计算中", done: "成功", failed: "失败",
+                     cancelled: "已取消" };
+const KIND_TEXT = { period: "周期筛查", morphology: "形态判别" };
+const FIT_TEXT = { supports_2p: "支持2P", supports_p: "矛盾(支持P)",
+                   neutral: "中性", not_evaluable: "不可评估" };
+
+function showMsg(el, text, ok) {
+  el.textContent = text;
+  el.className = "msg " + (ok ? "ok" : "err");
 }
 
 async function parseError(resp) {
-  try {
-    const j = await resp.json();
-    return j.detail || ("HTTP " + resp.status);
-  } catch (e) { return "HTTP " + resp.status; }
+  try { const j = await resp.json(); return j.detail || ("HTTP " + resp.status); }
+  catch (e) { return "HTTP " + resp.status; }
 }
 
-async function submitFormData(fd) {
-  const resp = await fetch("/api/jobs", { method: "POST", body: fd });
-  if (!resp.ok) { showMsg("提交失败:" + await parseError(resp), false); return; }
-  const j = await resp.json();
-  showMsg("已受理,批号 " + j.job_id, true);
-  selectedJob = j.job_id;
-  refresh();
-}
+// ---- 页签切换 ----
+document.querySelectorAll(".tab").forEach((t) => {
+  t.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
+    document.querySelectorAll(".tabpane").forEach((x) => x.classList.remove("active"));
+    t.classList.add("active");
+    $("pane-" + t.dataset.tab).classList.add("active");
+  });
+});
 
-$("submitForm").addEventListener("submit", async (ev) => {
+// ---- 周期筛查提交 ----
+$("periodForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const fd = new FormData(ev.target);
-  await submitFormData(fd);
+  const resp = await fetch("/api/jobs", { method: "POST", body: fd });
+  if (!resp.ok) { showMsg($("periodMsg"), "提交失败:" + await parseError(resp), false); return; }
+  const j = await resp.json();
+  showMsg($("periodMsg"), "已受理,批号 " + j.job_id, true);
+  selectedJob = j.job_id;
+  refresh();
 });
 
 $("sampleBtn").addEventListener("click", async () => {
   try {
     const r = await fetch("/api/sample.csv");
-    if (!r.ok) { showMsg("样例获取失败", false); return; }
+    if (!r.ok) { showMsg($("periodMsg"), "样例获取失败", false); return; }
     const blob = await r.blob();
     const fd = new FormData();
     fd.append("file", new File([blob], "sample_star.csv", { type: "text/csv" }));
     fd.append("period_min", "2");
     fd.append("period_max", "10");
-    await submitFormData(fd);
-  } catch (e) { showMsg("样例提交失败:" + e, false); }
+    const resp = await fetch("/api/jobs", { method: "POST", body: fd });
+    if (!resp.ok) { showMsg($("periodMsg"), "提交失败:" + await parseError(resp), false); return; }
+    const j = await resp.json();
+    showMsg($("periodMsg"), "已受理,批号 " + j.job_id, true);
+    selectedJob = j.job_id;
+    refresh();
+  } catch (e) { showMsg($("periodMsg"), "样例提交失败:" + e, false); }
 });
 
-function fmtTime(ts) {
-  return ts ? new Date(ts * 1000).toLocaleString() : "—";
-}
-const STATE_TEXT = { running: "计算中", done: "成功", failed: "失败",
-                     cancelled: "已取消" };
+// ---- 形态判别提交 ----
+$("morphForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const resp = await fetch("/api/morphology/jobs", { method: "POST", body: fd });
+  if (!resp.ok) { showMsg($("morphMsg"), "提交失败:" + await parseError(resp), false); return; }
+  const j = await resp.json();
+  showMsg($("morphMsg"), "已受理,批号 " + j.job_id, true);
+  selectedJob = j.job_id;
+  refresh();
+});
+
+$("morphSampleBtn").addEventListener("click", async () => {
+  try {
+    const r = await fetch("/api/sample_morph.csv");
+    if (!r.ok) { showMsg($("morphMsg"), "样例获取失败", false); return; }
+    const blob = await r.blob();
+    const fd = new FormData();
+    fd.append("file", new File([blob], "sample_eclipsing_binary.csv", { type: "text/csv" }));
+    fd.append("period", "3.3");
+    const resp = await fetch("/api/morphology/jobs", { method: "POST", body: fd });
+    if (!resp.ok) { showMsg($("morphMsg"), "提交失败:" + await parseError(resp), false); return; }
+    const j = await resp.json();
+    showMsg($("morphMsg"), "已受理,批号 " + j.job_id, true);
+    selectedJob = j.job_id;
+    refresh();
+  } catch (e) { showMsg($("morphMsg"), "样例提交失败:" + e, false); }
+});
+
+function fmtTime(ts) { return ts ? new Date(ts * 1000).toLocaleString() : "—"; }
+function num(v, d) { return (v === null || v === undefined || Number.isNaN(v)) ? "—"
+                       : Number(v).toPrecision(d || 4); }
 
 async function refresh() {
   let data;
   try { data = await (await fetch("/api/jobs")).json(); }
   catch (e) { return; }
   $("slots").textContent =
-    `并行名额:${data.running}/${data.max_parallel} 占用中`;
+    `周期筛查名额:${data.running}/${data.max_parallel} 占用中 · ` +
+    `形态判别名额:${data.running_morphology}/${data.max_parallel} 占用中`;
   const tbody = $("jobRows");
   if (!data.jobs.length) {
-    tbody.innerHTML = '<tr><td colspan="7">暂无批处理</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8">暂无批处理</td></tr>';
   } else {
     tbody.innerHTML = "";
     for (const j of data.jobs) {
       const tr = document.createElement("tr");
-      const canCancel = j.state === "running";
+      const param = j.kind === "period"
+        ? `${j.period_min} ~ ${j.period_max} 天`
+        : `P = ${j.period} 天`;
       tr.innerHTML =
         `<td class="mono">${j.job_id}</td>` +
+        `<td><span class="badge kind-${j.kind}">${KIND_TEXT[j.kind] || j.kind}</span></td>` +
         `<td>${esc(j.filename)}</td>` +
         `<td>${j.n_rows}</td>` +
-        `<td>${j.period_min} ~ ${j.period_max}</td>` +
+        `<td>${param}</td>` +
         `<td>${fmtTime(j.created_at)}</td>` +
         `<td><span class="badge st-${j.state}">${STATE_TEXT[j.state] || j.state}</span></td>`;
       const td = document.createElement("td");
@@ -186,7 +288,7 @@ async function refresh() {
       viewBtn.onclick = () => { selectedJob = j.job_id; lastDetailSig = null;
                                 renderDetail(); };
       td.appendChild(viewBtn);
-      if (canCancel) {
+      if (j.state === "running") {
         const cBtn = document.createElement("button");
         cBtn.textContent = "取消";
         cBtn.className = "danger";
@@ -203,11 +305,11 @@ async function refresh() {
 async function cancelJob(id) {
   const resp = await fetch(`/api/jobs/${id}/cancel`, { method: "POST" });
   const j = await resp.json();
-  if (resp.ok) showMsg(`批 ${id}:${j.detail || j.state}`, true);
-  else showMsg(`取消失败:${j.detail || resp.status}`, false);
+  if (resp.ok) showMsg($("periodMsg"), `批 ${id}:${j.detail || j.state}`, true);
   refresh();
 }
 
+// ---- 详情:按类型分派渲染 ----
 async function renderDetail() {
   const card = $("detailCard");
   let j;
@@ -217,17 +319,26 @@ async function renderDetail() {
     j = await resp.json();
   } catch (e) { return; }
   const sig = j.job_id + "|" + j.state + "|" + (j.finished_at || "");
-  if (sig === lastDetailSig) return;   // 状态未变,避免图片反复重载
+  if (sig === lastDetailSig) return;
   lastDetailSig = sig;
   card.hidden = false;
   $("dId").textContent = j.job_id;
-  const body = $("dBody");
-  let html =
-    `<p class="hint">状态:${STATE_TEXT[j.state] || j.state} · ` +
-    `文件:${esc(j.filename)} · 行数:${j.n_rows} · ` +
-    `周期范围:${j.period_min} ~ ${j.period_max} 天 · ` +
-    `提交:${fmtTime(j.created_at)}` +
-    (j.finished_at ? ` · 终结:${fmtTime(j.finished_at)}` : "") + `</p>`;
+  $("dBody").innerHTML =
+    j.kind === "morphology" ? renderMorph(j) : renderPeriod(j);
+}
+
+function headLine(j) {
+  const param = j.kind === "period"
+    ? `周期范围:${j.period_min} ~ ${j.period_max} 天`
+    : `最高峰周期 P:${j.period} 天`;
+  return `<p class="hint">类型:${KIND_TEXT[j.kind]} · 状态:${STATE_TEXT[j.state] || j.state} · ` +
+         `文件:${esc(j.filename)} · 行数:${j.n_rows} · ${param} · ` +
+         `提交:${fmtTime(j.created_at)}` +
+         (j.finished_at ? ` · 终结:${fmtTime(j.finished_at)}` : "") + `</p>`;
+}
+
+function renderPeriod(j) {
+  let html = headLine(j);
   if (j.state === "done" && j.metrics) {
     const m = j.metrics;
     html +=
@@ -254,7 +365,71 @@ async function renderDetail() {
   } else {
     html += `<p class="hint">正在计算,请稍候……(每批两个计算子进程)</p>`;
   }
-  body.innerHTML = html;
+  return html;
+}
+
+function renderMorph(j) {
+  let html = headLine(j);
+  if (j.state === "done" && j.metrics) {
+    const m = j.metrics;
+    html +=
+      `<div class="metrics">` +
+      `<div class="metric"><div class="k">判别结论</div>` +
+      `<div class="v"><span class="badge v-${m.verdict}" style="font-size:13px">${esc(m.verdict_text)}</span></div></div>` +
+      `<div class="metric"><div class="k">主食深度(加权)</div>` +
+      `<div class="v">${num(m.depths[0])} ± ${num(m.depth_errs[0])}</div></div>` +
+      `<div class="metric"><div class="k">次食深度(加权)</div>` +
+      `<div class="v">${num(m.depths[1])} ± ${num(m.depth_errs[1])}</div></div>` +
+      `<div class="metric"><div class="k">深度差 z(阈值 |z|≥2)</div>` +
+      `<div class="v">${num(m.depth_z, 3)}</div></div>` +
+      `<div class="metric"><div class="k">支持2P / 矛盾夜晚</div>` +
+      `<div class="v">${m.support_nights.length} / ${m.contrary_nights.length}</div></div>` +
+      `<div class="metric"><div class="k">全局 χ²(2P / P)</div>` +
+      `<div class="v">${num(m.global_chi2_2p,5)} / ${num(m.global_chi2_p,5)}</div></div>` +
+      `</div>` +
+      `<div class="reasonbox"><b>判定依据(含逐夜覆盖与原因)</b><ul>` +
+      m.reasons.map((r) => `<li>${esc(r)}</li>`).join("") + `</ul></div>` +
+      `<div class="plots">` +
+      `<figure><img src="/api/jobs/${j.job_id}/plot/fold.png?${Date.now()}">` +
+      `<figcaption>左:按 P 折相(两谷重叠);右:按 2P 折相(主/次食分离),红框为食窗</figcaption></figure>` +
+      `<figure><img src="/api/jobs/${j.job_id}/plot/night.png?${Date.now()}">` +
+      `<figcaption>逐夜食谷深度(同夜基线校正,带误差棒)与留一夜拟合结论</figcaption></figure>` +
+      `</div>` +
+      nightTable(m);
+  } else if (j.state === "failed") {
+    html += `<div class="errbox">${esc(j.error || "未知错误")}</div>`;
+  } else if (j.state === "cancelled") {
+    html += `<p class="hint">该批已被取消,计算结果不予发布,名额已释放。</p>`;
+  } else {
+    html += `<p class="hint">正在判别,请稍候……</p>`;
+  }
+  return html;
+}
+
+function nightTable(m) {
+  let h = `<h3 style="font-size:14px;color:#163a5f;margin:18px 0 8px">逐夜覆盖明细</h3>` +
+    `<div class="scrollx"><table class="night-table"><thead><tr>` +
+    `<th>night_id</th><th>点数</th>` +
+    `<th>E1 谷底/基线条数</th><th>E1 深度 ± 误差</th>` +
+    `<th>E2 谷底/基线条数</th><th>E2 深度 ± 误差</th>` +
+    `<th>留一夜拟合(2P vs P)</th><th>χ² 改善</th></tr></thead><tbody>`;
+  for (const r of m.nights) {
+    const cell = (k) => {
+      const d = r.depth[k], e = r.depth_err[k];
+      const cov = `${r.bottom_n[k] ?? 0} / ${r.baseline_n[k] ?? 0}`;
+      const dep = (d === null) ? "—" : `${num(d)} ± ${num(e)}`;
+      return `<td>${cov}</td><td>${dep}</td>`;
+    };
+    const imp = r.fit_improvement === null ? "—"
+                : (r.fit_improvement * 100).toFixed(1) + "%";
+    h += `<tr><td class="mono">${esc(r.night_id)}</td><td>${r.n_points}</td>` +
+         cell(0) + cell(1) +
+         `<td class="fit-${r.fit_verdict}">${FIT_TEXT[r.fit_verdict] || r.fit_verdict}</td>` +
+         `<td>${imp}</td></tr>`;
+  }
+  return h + `</tbody></table></div>` +
+    `<p class="hint">「谷底/基线条数」任一不足 2 时该夜不参与对应食谷的深度汇总;` +
+    `留一夜拟合以其余夜晚建模板、本夜做测试,χ² 改善 ≥10% 记为支持 2P。</p>`;
 }
 
 refresh();

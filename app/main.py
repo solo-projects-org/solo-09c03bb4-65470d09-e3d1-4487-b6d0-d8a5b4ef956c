@@ -1,21 +1,26 @@
 """周期变星候选筛选 —— FastAPI 主程序。
 
-功能
-----
-上传单颗星的 time_day、flux 两列 CSV(至少 10 行、值有限、时刻互异),
-填写 0<下限<上限 的周期范围;取倒数得频率范围,均匀取 10000 点,
-用带浮动均值的 Lomb–Scargle 计算功率谱,给出最高峰周期、功率谱图、
-按该周期折叠的相位散点图;固定时刻随机重排光通量 200 次,每次重算
-全频段最大功率,给出置换尾概率 (不低于原峰的次数+1)/201。
+两条并行的判别流水线
+====================
+1. **周期筛查**(原有,保持不变):上传 time_day、flux 两列 CSV 与周期
+   范围,取倒数得频率范围,均匀取 10000 点,用带浮动均值的
+   Lomb–Scargle 计算功率谱,给出最高峰周期、功率谱图、按该周期折叠的
+   相位散点图;固定时刻随机重排光通量 200 次给出置换尾概率。
+2. **食双星形态判别**(新增):上传含 night_id、time_day、flux、
+   flux_err 四列的同一颗星 CSV,填写周期筛查得到的最高峰周期 P;
+   分别按 P 和 2P 折相,比较同夜基线校正后的交替食谷深度,结合
+   测量误差与两种折相的留一夜拟合表现,给出「双食结构 / 未见双食
+   结构 / 待复核」结论及逐夜覆盖与原因,详见 app/morphology.py。
 
 并发与生命周期
 --------------
-* 每批任务使用两个计算子进程,最多两批并行,超额拒绝(HTTP 429);
-* 任务可查询、可取消;
-* 无论成功、失败还是取消,都必须等本批全部计算子进程退出、临时文件
-  清理完毕,才公布结局并释放名额;另一批不受影响;
-* 取消一经受理,不再发布任何迟到结果;重复取消不会重复释放名额;
-* 全部状态只保存在内存中。
+* 周期筛查:每批任务使用两个计算子进程,最多两批并行,超额拒绝
+  (HTTP 429);任务可查询、可取消;无论成功、失败还是取消,都必须
+  等本批全部计算子进程退出、临时文件清理完毕,才公布结局并释放名额;
+  另一批不受影响;取消一经受理,不再发布任何迟到结果;
+* 形态判别:在线程池中执行(纯 numpy,无子进程),最多两批并行,
+  超额拒绝;取消受理后不发布迟到结果;
+* 重复取消不会重复释放名额;全部状态只保存在内存中。
 """
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import matplotlib
@@ -40,20 +46,28 @@ import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
+from .morphology import VERDICT_TEXT, analyze as morph_analyze
+from .morph_plots import make_fold_comparison, make_night_chart
+
 APP_DIR = Path(__file__).resolve().parent
 WORKER_PY = APP_DIR / "worker.py"
 INDEX_HTML = APP_DIR / "static" / "index.html"
 SAMPLE_CSV = APP_DIR.parent / "sample" / "sample_star.csv"
+SAMPLE_MORPH_CSV = APP_DIR.parent / "sample" / "sample_eclipsing_binary.csv"
 
 N_FREQ = 10_000          # 频率网格点数
 N_PERM = 200             # 置换检验次数
 WORKERS_PER_JOB = 2      # 每批计算子进程数
-MAX_PARALLEL_JOBS = 2    # 最多并行批数
+MAX_PARALLEL_JOBS = 2    # 每条流水线最多并行批数
 MIN_ROWS = 10            # CSV 最少行数
 MAX_ROWS = 50_000        # CSV 最多行数(防御性上限)
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_KEPT_JOBS = 64       # 内存中最多保留的任务记录数
 TERMINAL_STATES = ("done", "failed", "cancelled")
+
+# 形态判别线程池:纯 numpy 计算,与周期筛查的子进程流水线相互独立
+MORPH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=MAX_PARALLEL_JOBS, thread_name_prefix="morph")
 
 # 全部任务状态只存内存
 JOBS: dict[str, "Job"] = {}
@@ -62,30 +76,38 @@ JOBS: dict[str, "Job"] = {}
 class Job:
     """一批计算任务的全部内存态。"""
 
-    def __init__(self, period_min: float, period_max: float,
-                 n_rows: int, filename: str) -> None:
+    def __init__(self, period_min: float | None, period_max: float | None,
+                 n_rows: int, filename: str, kind: str,
+                 period: float | None = None) -> None:
         self.id = uuid.uuid4().hex[:12]
+        self.kind = kind                  # period / morphology
         self.state = "running"  # running / done / failed / cancelled
         self.cancel_requested = False
         self.created_at = time.time()
         self.finished_at: float | None = None
         self.period_min = period_min
         self.period_max = period_max
+        self.period = period              # 形态判别输入的最高峰周期 P
         self.n_rows = n_rows
         self.filename = filename
         self.error: str | None = None
         self.result: dict | None = None  # 指标 + PNG 字节
-        self.tmpdir = Path(tempfile.mkdtemp(prefix=f"lsjob_{self.id}_"))
+        # 周期筛查使用临时目录与子进程;形态判别留空
+        self.tmpdir: Path | None = (
+            Path(tempfile.mkdtemp(prefix=f"lsjob_{self.id}_"))
+            if kind == "period" else None)
         self.procs: list[asyncio.subprocess.Process] = []
 
     def summary(self) -> dict:
         d = {
             "job_id": self.id,
+            "kind": self.kind,
             "state": self.state,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
             "period_min": self.period_min,
             "period_max": self.period_max,
+            "period": self.period,
             "n_rows": self.n_rows,
             "filename": self.filename,
             "error": self.error,
@@ -131,6 +153,52 @@ def validate_period_range(period_min: float, period_max: float) -> None:
         raise HTTPException(400, "周期上下限必须为有限数值")
     if not (0.0 < period_min < period_max):
         raise HTTPException(400, "周期范围须满足 0 < 下限 < 上限")
+
+
+def validate_morph_csv(raw: bytes) -> tuple[np.ndarray, np.ndarray,
+                                            np.ndarray, np.ndarray]:
+    """校验并解析形态判别 CSV,返回 (time_day, flux, flux_err, night_id)。"""
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+    except Exception as exc:
+        raise HTTPException(400, f"CSV 解析失败:{exc}")
+    df.columns = [str(c).strip() for c in df.columns]
+    required = ("night_id", "time_day", "flux", "flux_err")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise HTTPException(400, f"CSV 缺少必需列:{', '.join(missing)}"
+                                 "(需要 night_id、time_day、flux、flux_err)")
+    if len(df) < MIN_ROWS:
+        raise HTTPException(400, f"至少需要 {MIN_ROWS} 行数据,当前 {len(df)} 行")
+    if len(df) > MAX_ROWS:
+        raise HTTPException(400, f"数据行数超过上限 {MAX_ROWS}")
+
+    t = pd.to_numeric(df["time_day"], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(df["flux"], errors="coerce").to_numpy(dtype=float)
+    e = pd.to_numeric(df["flux_err"], errors="coerce").to_numpy(dtype=float)
+    if not (np.all(np.isfinite(t)) and np.all(np.isfinite(y))
+            and np.all(np.isfinite(e))):
+        raise HTTPException(400, "time_day、flux、flux_err 必须全部为有限"
+                                 "数值(不允许空值/NaN/Inf)")
+    if np.any(e <= 0.0):
+        raise HTTPException(400, "flux_err 必须全部为正数")
+    if np.unique(t).size != t.size:
+        raise HTTPException(400, "观测时刻必须互异(存在重复时刻)")
+
+    nights = df["night_id"]
+    if nights.isna().any():
+        raise HTTPException(400, "night_id 不允许空值")
+    night_arr = nights.astype(str).to_numpy()
+    n_nights = np.unique(night_arr).size
+    if n_nights < 2:
+        raise HTTPException(400, "至少需要 2 个不同 night_id 的夜晚"
+                                 "(单晚密集采样不能充当双食证据)")
+    return t, y, e, night_arr
+
+
+def validate_period_p(period: float) -> None:
+    if not math.isfinite(period) or period <= 0.0:
+        raise HTTPException(400, "最高峰周期 P 必须为正的有限数值")
 
 
 # --------------------------------------------------------------------------- #
@@ -354,6 +422,58 @@ def _evict_old_jobs() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 形态判别流水线(线程池内执行,纯 numpy 无子进程)
+# --------------------------------------------------------------------------- #
+
+def build_morph_result(res) -> dict:
+    """把 morphology.MorphResult 转成可 JSON 序列化的指标 + PNG 字节。"""
+    return {
+        "verdict": res.verdict,
+        "verdict_text": VERDICT_TEXT[res.verdict],
+        "reasons": res.reasons,
+        "n_nights": res.n_nights,
+        "period": res.period,
+        "eclipse_centers": [float(c) for c in res.eclipse_centers],
+        "half_width": float(res.half_width),
+        "depths": res.depths,
+        "depth_errs": res.depth_errs,
+        "depth_nights": res.depth_nights,
+        "depth_diff": res.depth_diff,
+        "depth_diff_err": res.depth_diff_err,
+        "depth_z": res.depth_z,
+        "support_nights": res.support_nights,
+        "contrary_nights": res.contrary_nights,
+        "neutral_nights": res.neutral_nights,
+        "global_chi2_2p": res.global_chi2_2p,
+        "global_chi2_p": res.global_chi2_p,
+        "nights": [r.to_dict() for r in res.nights],
+        "fold_png": make_fold_comparison(res),
+        "night_png": make_night_chart(res),
+    }
+
+
+def run_morph_job(job: Job, t: np.ndarray, y: np.ndarray,
+                  e: np.ndarray, nights: np.ndarray) -> None:
+    """线程池入口:形态判别计算;取消受理后不发布迟到结果。"""
+    try:
+        res = morph_analyze(t, y, e, nights, job.period)
+        result = build_morph_result(res)
+        if job.cancel_requested:
+            job.state = "cancelled"
+        else:
+            job.result = result
+            job.state = "done"
+    except Exception as exc:  # 分析阶段任何异常都记为失败
+        if job.cancel_requested:
+            job.state = "cancelled"
+        else:
+            job.state = "failed"
+            job.error = f"形态判别失败:{exc}"
+    finally:
+        job.finished_at = time.time()
+
+
+# --------------------------------------------------------------------------- #
 # HTTP 接口
 # --------------------------------------------------------------------------- #
 
@@ -373,6 +493,14 @@ async def sample_csv() -> FileResponse:
                         filename="sample_star.csv")
 
 
+@app.get("/api/sample_morph.csv")
+async def sample_morph_csv() -> FileResponse:
+    if not SAMPLE_MORPH_CSV.exists():
+        raise HTTPException(404, "形态判别样例文件不存在")
+    return FileResponse(SAMPLE_MORPH_CSV, media_type="text/csv",
+                        filename="sample_eclipsing_binary.csv")
+
+
 @app.post("/api/jobs", status_code=201)
 async def create_job(file: UploadFile = File(...),
                      period_min: float = Form(...),
@@ -385,12 +513,14 @@ async def create_job(file: UploadFile = File(...),
     t, y = validate_csv(raw)
 
     # 最多两批并行,超额拒绝(单事件循环内检查与登记之间无 await,无竞态)
-    running = sum(1 for j in JOBS.values() if j.state == "running")
+    running = sum(1 for j in JOBS.values()
+                  if j.state == "running" and j.kind == "period")
     if running >= MAX_PARALLEL_JOBS:
-        raise HTTPException(429, "已有两批正在计算,请稍后再试或取消其中一批")
+        raise HTTPException(429, "已有两批周期筛查正在计算,请稍后再试或取消其中一批")
 
     job = Job(period_min=period_min, period_max=period_max,
-              n_rows=len(t), filename=file.filename or "upload.csv")
+              n_rows=len(t), filename=file.filename or "upload.csv",
+              kind="period")
     # 子进程输入:规范化后的两列 CSV(临时文件,收尾时清除)
     np.savetxt(job.tmpdir / "input.csv", np.column_stack([t, y]),
                delimiter=",", header="time_day,flux", comments="",
@@ -401,11 +531,42 @@ async def create_job(file: UploadFile = File(...),
     return {"job_id": job.id, "state": job.state}
 
 
+@app.post("/api/morphology/jobs", status_code=201)
+async def create_morph_job(file: UploadFile = File(...),
+                           period: float = Form(...)) -> dict:
+    """食双星形态判别:四列 CSV + 周期筛查得到的最高峰周期 P。"""
+    validate_period_p(period)
+
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, "文件过大")
+    t, y, e, nights = validate_morph_csv(raw)
+
+    # 与周期筛查相互独立的名额;同样在单事件循环内检查与登记,无竞态
+    running = sum(1 for j in JOBS.values()
+                  if j.state == "running" and j.kind == "morphology")
+    if running >= MAX_PARALLEL_JOBS:
+        raise HTTPException(429, "已有两批形态判别正在计算,请稍后再试")
+
+    job = Job(period_min=None, period_max=None, n_rows=len(t),
+              filename=file.filename or "upload.csv", kind="morphology",
+              period=period)
+    JOBS[job.id] = job
+    _evict_old_jobs()
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(MORPH_EXECUTOR, run_morph_job, job, t, y, e, nights)
+    return {"job_id": job.id, "state": job.state}
+
+
 @app.get("/api/jobs")
 async def list_jobs() -> dict:
-    running = sum(1 for j in JOBS.values() if j.state == "running")
+    running_period = sum(1 for j in JOBS.values()
+                         if j.state == "running" and j.kind == "period")
+    running_morph = sum(1 for j in JOBS.values()
+                        if j.state == "running" and j.kind == "morphology")
     jobs = sorted(JOBS.values(), key=lambda j: j.created_at, reverse=True)
-    return {"running": running, "max_parallel": MAX_PARALLEL_JOBS,
+    return {"running": running_period, "running_morphology": running_morph,
+            "max_parallel": MAX_PARALLEL_JOBS,
             "jobs": [j.summary() for j in jobs]}
 
 
@@ -428,13 +589,15 @@ async def cancel_job(job_id: str) -> dict:
                 "detail": "该批已终结,取消不再生效"}
     if not job.cancel_requested:
         job.cancel_requested = True
-        for proc in job.procs:
-            _safe_terminate(proc)
-        # 兜底:5 秒后仍未退出则强杀,保证名额最终一定释放
-        asyncio.get_running_loop().call_later(
-            5.0, lambda j=job: [_safe_kill(p) for p in j.procs])
+        if job.kind == "period":
+            for proc in job.procs:
+                _safe_terminate(proc)
+            # 兜底:5 秒后仍未退出则强杀,保证名额最终一定释放
+            asyncio.get_running_loop().call_later(
+                5.0, lambda j=job: [_safe_kill(p) for p in j.procs])
+        # 形态判别为协作式取消:计算结束后检查标志,不发布迟到结果
     return {"job_id": job.id, "state": "cancelling",
-            "detail": "取消已受理,等待子进程退出并清理临时文件"}
+            "detail": "取消已受理,等待计算收尾并清理临时文件"}
 
 
 @app.get("/api/jobs/{job_id}/plot/{kind}.png")
@@ -444,7 +607,10 @@ async def job_plot(job_id: str, kind: str) -> Response:
         raise HTTPException(404, "任务不存在")
     if job.state != "done" or not job.result:
         raise HTTPException(409, "结果尚未公布")
-    key = {"power": "power_png", "phase": "phase_png"}.get(kind)
-    if key is None:
-        raise HTTPException(404, "未知图类型")
+    key = {
+        "power": "power_png", "phase": "phase_png",       # 周期筛查
+        "fold": "fold_png", "night": "night_png",         # 形态判别
+    }.get(kind)
+    if key is None or key not in job.result:
+        raise HTTPException(404, "该任务无此图类型")
     return Response(content=job.result[key], media_type="image/png")

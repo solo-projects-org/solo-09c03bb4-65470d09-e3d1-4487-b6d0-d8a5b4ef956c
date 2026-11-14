@@ -5,6 +5,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /srv
 
+# CJK 字体:保证任何中文标注都能被 matplotlib 正常渲染(不出豆腐块)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
